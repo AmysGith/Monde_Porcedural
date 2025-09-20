@@ -4,17 +4,22 @@ using UnityEngine;
 
 public class EndlessTerrain : MonoBehaviour
 {
-
     const float scale = 2f;
-
     const float viewerMoveThresholdForChunkUpdate = 25f;
     const float sqrViewerMoveThresholdForChunkUpdate = viewerMoveThresholdForChunkUpdate * viewerMoveThresholdForChunkUpdate;
 
     public LODInfo[] detailLevels;
     public static float maxViewDst;
 
+    [Header("Terrain Configuration")]
     public Transform viewer;
-    public Material mapMaterial;
+    public TerrainRegion[] terrainRegions;
+
+    [Header("Water Configuration")]
+    public bool generateWater = true;
+    public Material waterMaterial;
+    public LayerMask waterLayer = 4; // Layer "Water" par défaut
+    public float waterLevel = 0.3f; // Hauteur en dessous de laquelle l'eau apparaît
 
     public static Vector2 viewerPosition;
     Vector2 viewerPositionOld;
@@ -49,7 +54,6 @@ public class EndlessTerrain : MonoBehaviour
 
     void UpdateVisibleChunks()
     {
-
         for (int i = 0; i < terrainChunksVisibleLastUpdate.Count; i++)
         {
             terrainChunksVisibleLastUpdate[i].SetVisible(false);
@@ -71,7 +75,7 @@ public class EndlessTerrain : MonoBehaviour
                 }
                 else
                 {
-                    terrainChunkDictionary.Add(viewedChunkCoord, new TerrainChunk(viewedChunkCoord, chunkSize, detailLevels, transform, mapMaterial));
+                    terrainChunkDictionary.Add(viewedChunkCoord, new TerrainChunk(viewedChunkCoord, chunkSize, detailLevels, terrainRegions, transform, generateWater, waterMaterial, waterLayer, waterLevel));
                 }
             }
         }
@@ -80,6 +84,7 @@ public class EndlessTerrain : MonoBehaviour
     public class TerrainChunk
     {
         GameObject meshObject;
+        GameObject waterObject;
         Vector2 position;
         Bounds bounds;
 
@@ -87,31 +92,64 @@ public class EndlessTerrain : MonoBehaviour
         MeshFilter meshFilter;
         MeshCollider meshCollider;
 
+        // Composants pour l'eau
+        MeshRenderer waterMeshRenderer;
+        MeshFilter waterMeshFilter;
+        MeshCollider waterMeshCollider;
+
         LODInfo[] detailsLevels;
         LODMesh[] lodMeshes;
         LODMesh collisionLODMesh;
+        TerrainRegion[] terrainRegions;
+
+        bool generateWater;
+        Material waterMaterial;
+        LayerMask waterLayer;
+        float waterLevel;
 
         MapData mapData;
         bool mapDataReceived;
         int previousLODIndex = -1;
 
-        public TerrainChunk(Vector2 coord, int size, LODInfo[] detailsLevels, Transform parent, Material material)
+        public TerrainChunk(Vector2 coord, int size, LODInfo[] detailsLevels, TerrainRegion[] terrainRegions, Transform parent, bool generateWater, Material waterMaterial, LayerMask waterLayer, float waterLevel)
         {
             this.detailsLevels = detailsLevels;
+            this.terrainRegions = terrainRegions;
+            this.generateWater = generateWater;
+            this.waterMaterial = waterMaterial;
+            this.waterLayer = waterLayer;
+            this.waterLevel = waterLevel;
 
             position = coord * size;
             bounds = new Bounds(position, Vector2.one * size);
             Vector3 positionV3 = new Vector3(position.x, 0, position.y);
 
+            // Création du terrain
             meshObject = new GameObject("Terrain Chunk");
             meshRenderer = meshObject.AddComponent<MeshRenderer>();
             meshFilter = meshObject.AddComponent<MeshFilter>();
             meshCollider = meshObject.AddComponent<MeshCollider>();
-            meshRenderer.material = material;
 
             meshObject.transform.position = positionV3 * scale;
             meshObject.transform.parent = parent;
             meshObject.transform.localScale = Vector3.one * scale;
+
+            // Création de l'eau si activée
+            if (generateWater && waterMaterial != null)
+            {
+                waterObject = new GameObject("Water Chunk");
+                waterMeshRenderer = waterObject.AddComponent<MeshRenderer>();
+                waterMeshFilter = waterObject.AddComponent<MeshFilter>();
+                waterMeshCollider = waterObject.AddComponent<MeshCollider>();
+
+                waterMeshRenderer.material = waterMaterial;
+                waterObject.layer = (int)Mathf.Log(waterLayer.value, 2);
+
+                waterObject.transform.position = positionV3 * scale;
+                waterObject.transform.parent = parent;
+                waterObject.transform.localScale = Vector3.one * scale;
+            }
+
             SetVisible(false);
 
             lodMeshes = new LODMesh[detailsLevels.Length];
@@ -132,10 +170,176 @@ public class EndlessTerrain : MonoBehaviour
             this.mapData = mapData;
             mapDataReceived = true;
 
-            Texture2D texture = TextureGenerator.TextureFromColourMap(mapData.colourMap, MapGenerator.mapChunkSize, MapGenerator.mapChunkSize);
-            meshRenderer.material.mainTexture = texture;
+            // Application des materials basés sur la hauteur
+            ApplyTerrainMaterials(mapData);
+
+            // Génération de l'eau si nécessaire
+            if (generateWater && waterObject != null)
+            {
+                GenerateWaterMesh(mapData);
+            }
 
             UpdateTerrainChunk();
+        }
+
+        void ApplyTerrainMaterials(MapData mapData)
+        {
+            // Trouve le material dominant pour ce chunk
+            Material dominantMaterial = GetDominantMaterial(mapData);
+            int dominantLayer = GetDominantLayer(mapData);
+
+            if (dominantMaterial != null)
+            {
+                meshRenderer.material = dominantMaterial;
+            }
+
+            meshObject.layer = dominantLayer;
+        }
+
+        Material GetDominantMaterial(MapData mapData)
+        {
+            if (terrainRegions == null || terrainRegions.Length == 0) return null;
+
+            Dictionary<Material, int> materialCount = new Dictionary<Material, int>();
+
+            for (int y = 0; y < mapData.heightMap.GetLength(1); y++)
+            {
+                for (int x = 0; x < mapData.heightMap.GetLength(0); x++)
+                {
+                    float currentHeight = mapData.heightMap[x, y];
+
+                    for (int i = 0; i < terrainRegions.Length; i++)
+                    {
+                        if (currentHeight >= terrainRegions[i].height)
+                        {
+                            Material mat = terrainRegions[i].material;
+                            if (mat != null)
+                            {
+                                if (materialCount.ContainsKey(mat))
+                                    materialCount[mat]++;
+                                else
+                                    materialCount[mat] = 1;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            Material dominantMaterial = null;
+            int maxCount = 0;
+            foreach (var kvp in materialCount)
+            {
+                if (kvp.Value > maxCount)
+                {
+                    maxCount = kvp.Value;
+                    dominantMaterial = kvp.Key;
+                }
+            }
+
+            return dominantMaterial;
+        }
+
+        int GetDominantLayer(MapData mapData)
+        {
+            if (terrainRegions == null || terrainRegions.Length == 0) return 0;
+
+            Dictionary<int, int> layerCount = new Dictionary<int, int>();
+
+            for (int y = 0; y < mapData.heightMap.GetLength(1); y++)
+            {
+                for (int x = 0; x < mapData.heightMap.GetLength(0); x++)
+                {
+                    float currentHeight = mapData.heightMap[x, y];
+
+                    for (int i = 0; i < terrainRegions.Length; i++)
+                    {
+                        if (currentHeight >= terrainRegions[i].height)
+                        {
+                            int layer = (int)Mathf.Log(terrainRegions[i].layer.value, 2);
+                            if (layerCount.ContainsKey(layer))
+                                layerCount[layer]++;
+                            else
+                                layerCount[layer] = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            int dominantLayer = 0;
+            int maxCount = 0;
+            foreach (var kvp in layerCount)
+            {
+                if (kvp.Value > maxCount)
+                {
+                    maxCount = kvp.Value;
+                    dominantLayer = kvp.Key;
+                }
+            }
+
+            return dominantLayer;
+        }
+
+        void GenerateWaterMesh(MapData mapData)
+        {
+            // Crée un plan d'eau simple à la hauteur spécifiée
+            List<Vector3> vertices = new List<Vector3>();
+            List<int> triangles = new List<int>();
+            List<Vector2> uvs = new List<Vector2>();
+
+            bool hasWater = false;
+
+            // Vérifie s'il y a des zones assez basses pour avoir de l'eau
+            for (int y = 0; y < mapData.heightMap.GetLength(1); y++)
+            {
+                for (int x = 0; x < mapData.heightMap.GetLength(0); x++)
+                {
+                    if (mapData.heightMap[x, y] <= waterLevel)
+                    {
+                        hasWater = true;
+                        break;
+                    }
+                }
+                if (hasWater) break;
+            }
+
+            if (hasWater)
+            {
+                // Crée un plan d'eau simple
+                int meshSize = MapGenerator.mapChunkSize;
+                float topLeftX = (meshSize - 1) / -2f;
+                float topLeftZ = (meshSize - 1) / 2f;
+
+                vertices.Add(new Vector3(topLeftX, waterLevel, topLeftZ));
+                vertices.Add(new Vector3(topLeftX + meshSize - 1, waterLevel, topLeftZ));
+                vertices.Add(new Vector3(topLeftX, waterLevel, topLeftZ - (meshSize - 1)));
+                vertices.Add(new Vector3(topLeftX + meshSize - 1, waterLevel, topLeftZ - (meshSize - 1)));
+
+                triangles.AddRange(new int[] { 0, 1, 2, 1, 3, 2 });
+
+                uvs.Add(new Vector2(0, 1));
+                uvs.Add(new Vector2(1, 1));
+                uvs.Add(new Vector2(0, 0));
+                uvs.Add(new Vector2(1, 0));
+
+                Mesh waterMesh = new Mesh();
+                waterMesh.vertices = vertices.ToArray();
+                waterMesh.triangles = triangles.ToArray();
+                waterMesh.uv = uvs.ToArray();
+                waterMesh.RecalculateNormals();
+
+                waterMeshFilter.mesh = waterMesh;
+                waterMeshCollider.sharedMesh = waterMesh;
+            }
+            else
+            {
+                // Pas d'eau dans ce chunk
+                if (waterObject != null)
+                {
+                    waterObject.SetActive(false);
+                }
+            }
         }
 
         public void UpdateTerrainChunk()
@@ -188,16 +392,19 @@ public class EndlessTerrain : MonoBehaviour
                     }
 
                     terrainChunksVisibleLastUpdate.Add(this);
-
                 }
 
                 SetVisible(visible);
             }
         }
 
-        public void SetVisible(bool visisble)
+        public void SetVisible(bool visible)
         {
-            meshObject.SetActive(visisble);
+            meshObject.SetActive(visible);
+            if (waterObject != null)
+            {
+                waterObject.SetActive(visible);
+            }
         }
 
         public bool IsVisible()
@@ -208,7 +415,6 @@ public class EndlessTerrain : MonoBehaviour
 
     class LODMesh
     {
-
         public Mesh mesh;
         public bool hasRequestedMesh;
         public bool hasMesh;
@@ -234,7 +440,6 @@ public class EndlessTerrain : MonoBehaviour
             hasRequestedMesh = true;
             mapGenerator.RequestMeshData(mapData, lod, OnMeshDataReceived);
         }
-
     }
 
     [System.Serializable]
@@ -243,5 +448,21 @@ public class EndlessTerrain : MonoBehaviour
         public int lod;
         public float visibleDstThreshold;
         public bool useForCollider;
+    }
+
+    [System.Serializable]
+    public struct TerrainRegion
+    {
+        [Header("Terrain Settings")]
+        public string name;
+        public float height;
+
+        [Header("Visual Settings")]
+        public Material material;
+        public LayerMask layer;
+
+        [Header("Properties")]
+        public bool walkable;
+        public float friction;
     }
 }
